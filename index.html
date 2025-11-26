@@ -1,0 +1,94 @@
+<html>
+
+<head>
+<style>
+    * {
+        font-family: Arial, Helvetica, sans-serif;
+        margin: 0;
+        padding: 0;
+    }
+    
+    body {
+        text-align: center;
+        background: linear-gradient(135deg, #e8f0f8 0%, #d4e6f1 100%);
+        color: #003d7a;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        padding: 20px;
+    }
+    
+    .logo {
+        max-width: 400px;
+        margin-bottom: 60px;
+    }
+    
+    h1 {
+        font-size: 8vh;
+        font-weight: bold;
+        margin-bottom: 40px;
+        text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    h1 #date {
+        display: block;
+        font-size: 5vh;
+        margin-top: 20px;
+        color: #0066cc;
+    }
+    
+    h2 {
+        font-size: 10vh;
+        font-weight: bold;
+        margin: 40px 0;
+        background: rgba(0, 102, 204, 0.08);
+        padding: 30px 60px;
+        border-radius: 20px;
+        border: 2px solid rgba(0, 102, 204, 0.15);
+    }
+    
+    h2 #number {
+        color: #0066cc;
+        font-size: 1.3em;
+    }
+    
+    p {
+        font-size: 3.5vh;
+        margin-top: 50px;
+        opacity: 0.9;
+    }
+</style>
+</head>
+
+<body>
+    <img src="https://www.utcsheffield.org.uk/olp/assets/sites/3/2021/07/UTC-Sheffield-Olympic-Legacy-Park-Horizontal.svg" alt="UTC Sheffield Logo" class="logo">
+    
+    <h1>Y13 UCAS DEADLINE <br><span id="date">05/12/2025</span></h1>
+
+    <h2><span id="number">?</span> Days to go!</h2>
+
+    <p>Any questions please speak with tutors, Mr West or Mr Ahmed</p>
+
+</body>
+<script>
+    function updateCountdown() {
+        const dateElement = document.getElementById('date');
+        const dateString = dateElement.textContent;
+        // Parse date string in format DD/MM/YYYY
+        const [day, month, year] = dateString.split('/');
+        const deadline = new Date(`${year}-${month}-${day}T00:00:00`);
+        
+        const now = new Date();
+        const diffTime = deadline - now;
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        document.getElementById('number').textContent = diffDays >= 0 ? diffDays : 0;
+    }
+
+    updateCountdown();
+    setInterval(updateCountdown, 60 * 1000); // Update every minute
+
+</script>
+
+</html>
