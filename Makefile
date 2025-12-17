@@ -3,17 +3,35 @@ embed:
 
 build-images: embed
 	python3 scripts/html_to_images.py --src embedded_pages --out output_images
-	python3 scripts/create_build.py --pages embedded_pages --images output_images --build build
+	python3 scripts/create_build.py --pages embedded_pages --images output_images --videos output_videos --build build
 
+#videos:
 videos:
-	python3 scripts/images_to_videos.py --src output_images --out output_videos --duration 10 --width 1920 --height 1080
+	@echo 'Generating 5s videos from output_images/ into output_videos/5s using ffmpeg'
+	python3 scripts/images_to_videos.py --src output_images --out output_videos/5s --duration 5 --width 1920 --height 1080
 
 build-videos: build-images videos
 	@echo 'Build and video creation done.'
 
+## removed old record-playwright/records targets (duplicate)
+
+record-playwright:
+	python3 scripts/pages_record_playwright.py --src embedded_pages --out output_videos --durations 5 --width 1920 --height 1080
+
+record-playwright-long:
+	python3 scripts/pages_record_playwright.py --src embedded_pages --out output_videos --durations 10 60 --width 1920 --height 1080
+
+build-record-playwright: build-images record-playwright
+	python3 scripts/create_build.py --pages embedded_pages --images output_images --videos output_videos --build build
+	@echo 'Build, playright record, and create build done.'
+
+build-record-playwright-long: build-images record-playwright-long
+	python3 scripts/create_build.py --pages embedded_pages --images output_images --videos output_videos --build build
+	@echo 'Build, playright record (long), and create build done.'
+
 build-images-direct:
 	python3 scripts/html_to_images.py --src pages --out output_images
-	python3 scripts/create_build.py --pages pages --images output_images --build build
+	python3 scripts/create_build.py --pages pages --images output_images --videos output_videos --build build
 
 build-videos-direct: build-images-direct videos
 	@echo 'Build (direct) and video creation done.'

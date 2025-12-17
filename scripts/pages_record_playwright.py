@@ -3,9 +3,9 @@
 Record videos for each HTML page in a directory using Playwright and convert to MP4.
 
 Usage:
-  python3 scripts/pages_record_playwright.py --src embedded_pages --out output_videos --durations 10 60 --width 1920 --height 1080
+    python3 scripts/pages_record_playwright.py --src embedded_pages --out output_videos --durations 5 --width 1920 --height 1080
 
-This will create subfolders in the output dir named by duration (e.g., output_videos/10s and output_videos/60s)
+This will create subfolders in the output dir named by duration (e.g., output_videos/5s)
 """
 
 import argparse
@@ -100,7 +100,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--src', default='embedded_pages', help='Source pages dir (default: embedded_pages)')
     parser.add_argument('--out', default='output_videos', help='Output videos base dir (default: output_videos)')
-    parser.add_argument('--durations', type=int, nargs='+', default=[10, 60], help='Durations in seconds to record (e.g., 10 60)')
+    parser.add_argument('--durations', type=int, nargs='+', default=[5], help='Durations in seconds to record (default: 5)')
     parser.add_argument('--width', type=int, default=1920)
     parser.add_argument('--height', type=int, default=1080)
     parser.add_argument('--keep-webm', action='store_true', help='Do not delete intermediate webm recordings')

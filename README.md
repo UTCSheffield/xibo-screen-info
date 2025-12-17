@@ -72,6 +72,8 @@ This project also supports creating a `build/` folder that contains copies of th
 - `build/index.html`: a copy of one page chosen at random from `build/pages/` (selected during build). This gives an immediate single page to preview.
 - `build/pages/index.html`: an index listing all pages (links to `build/pages/<page>.html`).
 - `build/output_images/index.html`: an index listing all rendered images (links to files in `build/output_images/`).
+ - `build/output_images/index.html`: an index listing all rendered images (links to files in `build/output_images/`).
+ - `build/output_videos/index.html`: if videos exist, an index of generated videos. Videos are copied into `build/output_videos/<duration>/` (for example `5s` subfolder by default) and indexed by `create_build.py` when the `--videos` argument is supplied.
 
 Create the build directory (after running `make build-images` or `make build-images-direct`):
 
@@ -84,20 +86,36 @@ Or to explicitly call the builder:
 
 ```bash
 python3 scripts/create_build.py --pages embedded_pages --images output_images --build build --seed 42
+# If you have generated videos, include them in the build using --videos
+python3 scripts/create_build.py --pages embedded_pages --images output_images --videos output_videos --build build --seed 42
 ```
 
 The `--seed` option ensures repeatable random page selection for `build/index.html`.
 Videos
 ------
-You can create MP4 videos from the static PNGs in `output_images/` using ffmpeg. The repository contains a helper script `scripts/images_to_videos.py` and Makefile targets:
+You can create MP4 videos from the static PNGs in `output_images/` using ffmpeg. The repository contains a helper script `scripts/images_to_videos.py` and Makefile targets.
 
 ```bash
-make videos                # create videos in output_videos/ from output_images/
+make videos                # create 5s videos in output_videos/5s from output_images/
 make build-videos          # run make build-images then make videos (embedded)
 make build-videos-direct   # run make build-images-direct then make videos (no embed)
 ```
 
-Requirements: `ffmpeg` must be installed on the machine that runs the command (`sudo apt install ffmpeg` on Ubuntu).
+Requirements: `ffmpeg` must be installed on the machine that runs the command (`sudo apt install ffmpeg` on Ubuntu). The images -> 5s video pipeline will create `output_videos/5s/` subfolder.
+
+Playwright-based recordings
+----------------------------
+If your HTML pages include animations, transitions, or you want a video output that matches the browser rendering, use the Playwright recorder which captures pages into webm then converts them to MP4 with ffmpeg.
+
+Usage (Makefile):
+```bash
+make record-playwright         # Record pages in embedded_pages to output_videos/ (records 5s by default)
+make build-record-playwright   # build images, then record pages (5s), then update build/ (copies output_videos into build/)
+make record-playwright-long    # record 10s and 60s variants (occasional/long runs)
+make build-record-playwright-long # build, then record 10s/60s, then update build/
+```
+
+Requirements: Playwright and Chromium browsers must be installed (`python3 -m playwright install --with-deps`) and ffmpeg must be available.
 
 Upload videos to SharePoint
 ---------------------------
