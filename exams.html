@@ -96,32 +96,67 @@
     
     <h1>Y11 Exams Start <span id="date1">07/05/2026</span></h1>
     <h2><span id="days1">?</span> Days to go! 
-        (<span id="weekdays1">?</span> weekdays)
+        (<span id="weekdays1">?</span> school days)
     </h2>
     <br>
     <br>
     <!-- Example second date block (optional). You can remove or duplicate as needed. -->
     <h1>6th Form Exams <span id="date2">11/05/2026</span></h1>
     <h2><span id="days2">?</span> Days to go! 
-        (<span id="weekdays2">?</span> weekdays)
+        (<span id="weekdays2">?</span> school days)
     </h2>
 
 </body>
 <script>
-    function countWeekdaysBetween(startDate, endDate) {
-        // Counts Monday-Friday between startDate (inclusive) and endDate (exclusive)
-        if (endDate <= startDate) return 0;
+    const schooldaysCache = {
+        loaded: false,
+        set: null,
+        promise: null
+    };
+
+    function toIso(date) {
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    }
+
+    function countSchooldaysBetween(startDate, endDate, schooldaySet) {
+        // Counts schooldays between startDate (inclusive) and endDate (exclusive)
+        if (endDate <= startDate || !schooldaySet) return 0;
         let count = 0;
         const cursor = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
         while (cursor < endDate) {
-            const dow = cursor.getDay(); // 0=Sun, 6=Sat
-            if (dow !== 0 && dow !== 6) count++;
+            if (schooldaySet.has(toIso(cursor))) count++;
             cursor.setDate(cursor.getDate() + 1);
         }
         return count;
     }
 
-    function updateCountdowns() {
+    async function loadSchooldays() {
+        if (schooldaysCache.loaded) return schooldaysCache.set;
+        if (schooldaysCache.promise) return schooldaysCache.promise;
+
+        schooldaysCache.promise = fetch('schoolyear.json')
+            .then(resp => resp.json())
+            .then(data => {
+                schooldaysCache.loaded = true;
+                schooldaysCache.set = new Set(data.schooldays || []);
+                return schooldaysCache.set;
+            })
+            .catch(err => {
+                console.error('Failed to load schoolyear.json', err);
+                schooldaysCache.loaded = true;
+                schooldaysCache.set = null;
+                return null;
+            });
+
+        return schooldaysCache.promise;
+    }
+
+    async function updateCountdowns() {
+        const schooldaySet = await loadSchooldays();
+
         // Find all elements with id starting with 'date' followed by a number (date1, date2, ...)
         const dateElements = Array.from(document.querySelectorAll('[id^="date"]'))
             .filter(el => /^date\d+$/.test(el.id));
@@ -134,7 +169,7 @@
 
             // Expect format DD/MM/YYYY
             const [day, month, year] = dateString.split('/');
-            const deadline = new Date(`${year}-${month}-${day}T00:00:00`);
+            const deadline = new Date(`${year}-${month}-${day}T08:00:00`);
 
             const diffTime = deadline - now;
             let diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
@@ -146,19 +181,21 @@
                 daysEl.textContent = diffDays;
             }
 
-            // Set weekdaysN as count of Monday-Friday between today and deadline
+            // Set weekdaysN as count of schooldays between today and deadline
             const weekdaysEl = document.getElementById(`weekdays${index}`);
             if (weekdaysEl) {
                 const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
                 const end = new Date(`${year}-${month}-${day}T00:00:00`);
-                const weekdays = countWeekdaysBetween(start, end);
+                const weekdays = schooldaySet ? countSchooldaysBetween(start, end, schooldaySet) : 0;
                 weekdaysEl.textContent = weekdays;
             }
         }
     }
 
-    updateCountdowns();
-    setInterval(updateCountdowns, 60 * 1000); // Update every minute
+    loadSchooldays().then(() => {
+        updateCountdowns();
+        setInterval(updateCountdowns, 60 * 1000); // Update every minute
+    });
 
 </script>
 
