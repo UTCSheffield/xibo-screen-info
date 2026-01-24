@@ -47,14 +47,14 @@
 
     .logo {
         max-width: 450px;
-        margin-bottom: 60px;
+        /* margin-bottom: 60px; */
     }
 
     h1 {
         font-size: 10vh;
         font-weight: 700;
         margin-bottom: 0px;
-        margin-top: 12px;
+        margin-top: 20px;
         color: #000000;
         font-weight: 600;
     }
@@ -62,11 +62,15 @@
     h2 {
         font-size: 8vh;
         font-weight: 700;
-        margin: 0px 0 20px 0;
-        color: #0066cc;
+        margin: 0px 0 0px 0;
         background: 000000;
         padding: 0;
         border: none;
+    }
+
+    .countdown-text {
+        color: #0066cc;
+        /* margin-bottom: 20px; */
     }
 
     h3 {
@@ -94,15 +98,17 @@
 <body>
     <img src="https://www.utcsheffield.org.uk/olp/assets/sites/3/2021/07/UTC-Sheffield-Olympic-Legacy-Park-Horizontal.svg" alt="UTC Sheffield Logo" class="logo">
     
-    <h1>Y11 Exams Start <span id="date1">07/05/2026</span></h1>
-    <h2><span id="days1">?</span> Days to go! 
+    <h1>Y11 Exams</h1>
+    <h2><span id="date1">07/05/2026</span></h2>
+    <h2 class="countdown-text"><span id="days1">?</span> Days to go! 
         (<span id="weekdays1">?</span> school days)
     </h2>
     <br>
     <br>
     <!-- Example second date block (optional). You can remove or duplicate as needed. -->
-    <h1>6th Form Exams <span id="date2">11/05/2026</span></h1>
-    <h2><span id="days2">?</span> Days to go! 
+    <h1>6th Form Exams</h1>
+    <h2><span id="date2">11/05/2026</span></h2>
+    <h2 class="countdown-text"><span id="days2">?</span> Days to go! 
         (<span id="weekdays2">?</span> school days)
     </h2>
 
