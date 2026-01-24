@@ -137,15 +137,15 @@
         if (schooldaysCache.loaded) return schooldaysCache.set;
         if (schooldaysCache.promise) return schooldaysCache.promise;
 
-        schooldaysCache.promise = fetch('schoolyear.json')
+        schooldaysCache.promise = fetch('schooldays.json')
             .then(resp => resp.json())
             .then(data => {
                 schooldaysCache.loaded = true;
-                schooldaysCache.set = new Set(data.schooldays || []);
+                schooldaysCache.set = new Set(data.all_schooldays || []);
                 return schooldaysCache.set;
             })
             .catch(err => {
-                console.error('Failed to load schoolyear.json', err);
+                console.error('Failed to load schooldays.json', err);
                 schooldaysCache.loaded = true;
                 schooldaysCache.set = null;
                 return null;

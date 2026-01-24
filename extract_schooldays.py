@@ -1,7 +1,10 @@
 import json
+import sys
 import requests
 import re
 import statistics
+import numpy as np
+from sklearn.cluster import KMeans
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -39,23 +42,28 @@ def download_pdf(url, year):
         print(f"✗ Error downloading {year}: {e}")
         return None
 
-def extract_schooldays_from_pdf(pdf_path, academic_year):
-    """Extract unmarked weekday (schooldays) from a calendar PDF."""
+def extract_schooldays_from_pdf(pdf_path, academic_year, debug=False):
+    """Extract schooldays, training_days, and holidays from a calendar PDF."""
     schooldays = []
+    training_days = []
     holidays = []
+    bank_holidays = []
     exam_results_days = []
     start_year = int(academic_year.split("-")[0])
-    
+
+    # Patch: Use a mutable set for bank_holidays so it can be populated by extract_with_pymupdf
     if HAS_PYMUPDF:
-        extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holidays, exam_results_days)
+        extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, training_days, holidays, exam_results_days, bank_holidays, debug=debug)
     else:
-        extract_with_pdfplumber(pdf_path, academic_year, start_year, schooldays, holidays)
-    
+        extract_with_pdfplumber(pdf_path, academic_year, start_year, schooldays, holidays, debug=debug)
+    # Ensure all bank holidays are also included in holidays
+    holidays = set(holidays) | set(bank_holidays)
+    all_schooldays = sorted((set(schooldays) | set(training_days)) - set(bank_holidays))  # Exclude bank holidays from schooldays
     return {
         "academic_year": academic_year,
-        "schooldays": sorted(set(schooldays)),   # ensure unique
-        "holidays": sorted(set(holidays)),       # ensure unique
-        "exam_results_days": sorted(set(exam_results_days))
+        "schooldays": sorted(set(schooldays) - set(bank_holidays)),       # Children in school (unshaded), excluding bank holidays
+        "training_days": sorted(set(training_days) - set(bank_holidays)), # Staff in, children out (green boxes), excluding bank holidays
+        "holidays": sorted(holidays)                 # School closed (orange/red boxes + bank holidays)
     }
 
 def _inflate_rect(rect, margin=8):
@@ -72,10 +80,43 @@ def _normalize_rgb(fill_color):
         return (round(fill_color[0], 3), round(fill_color[1], 3), round(fill_color[2], 3))
     return None
 
-def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holidays, exam_results_days):
+def _color_distance(a, b):
+    if not a or not b:
+        return float('inf')
+    return ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
+
+def classify_box_color(rgb):
+    """Classify a shaded day-cell color as 'holiday' or 'training' based on known palettes.
+    Orange/Red = half-term closures (holidays), Green = Staff Training Days.
+    Returns 'holiday' | 'training' | 'unknown'."""
+    if not rgb:
+        return 'unknown'
+    # Known palettes from both PDFs
+    # Orange: half-term and closure periods
+    holiday_oranges = [(1.0, 0.6, 0.0), (1.0, 0.753, 0.0)]
+    # Red: Bank Holidays
+    bank_holiday_reds = [(1.0, 0.0, 0.0)]
+    # Green: Staff Training Days (teachers in, children out)
+    staff_training_greens = [(0.573, 0.816, 0.314), (0.0, 0.69, 0.314), (0.0, 0.8, 0.0)]
+    tol = 0.12
+    for ref in holiday_oranges:
+        if _color_distance(rgb, ref) <= tol:
+            return 'holiday'
+    for ref in bank_holiday_reds:
+        if _color_distance(rgb, ref) <= tol:
+            return 'bank_holiday'
+    for ref in staff_training_greens:
+        if _color_distance(rgb, ref) <= tol:
+            return 'training'
+    return 'unknown'
+
+def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, training_days, holidays, exam_results_days, bank_holidays=None, debug=False):
     """Extract using PyMuPDF with text positioning."""
-    print(f"Processing {academic_year} with PyMuPDF...")
+    if debug:
+        print(f"Processing {academic_year} with PyMuPDF...")
     doc = fitz.open(pdf_path)
+    if bank_holidays is None:
+        bank_holidays = []
     
     stats = {
         'total_numbers': 0,
@@ -94,7 +135,8 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
     # Note: shaded positions are tracked per page to avoid cross-page contamination
     unshaded_dates = set()  # Track dates in white/unshaded cells
     all_expected_counts = {}
-    shaded_holiday_dates = set()  # Dates that are shaded (holidays)
+    shaded_holiday_dates = set()  # Dates with orange/red boxes (closures)
+    shaded_training_dates = set()  # Dates with green boxes (staff training days)
     iso_date_color_map = {}  # ISO date -> (r,g,b)
     # Track row y-positions per month to infer dates when text is missing
     month_row_ys = defaultdict(lambda: defaultdict(list))
@@ -107,6 +149,125 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
     all_twenty_seven_spans = []
     # Collect all month headers across pages
     all_month_headers = []
+
+    # --- LEGEND/KEY DETECTION ---
+    legend_boxes = []  # (rgb, y_center, x_right)
+    legend_labels = [] # (label, y_center, x_left)
+    legend_found = False
+    for page_num, page in enumerate(doc):
+        page_height = page.rect.height
+        page_width = page.rect.width
+        # Assume legend is in bottom left 20% of the page
+        legend_rect = (0, page_height * 0.8, page_width * 0.4, page_height)
+        blocks = page.get_text("dict")["blocks"]
+        # Find colored boxes in legend area
+        for drawing in page.get_drawings():
+            rect = drawing["rect"]
+            fill_color = drawing.get("fill")
+            if not fill_color:
+                continue
+            rgb = _normalize_rgb(fill_color)
+            if rgb and rgb != (1.0, 1.0, 1.0):
+                # Check if box is in legend area
+                if legend_rect[0] <= rect.x0 <= legend_rect[2] and legend_rect[1] <= rect.y0 <= legend_rect[3]:
+                    y_center = (rect.y0 + rect.y1) / 2
+                    x_right = rect.x1
+                    legend_boxes.append((rgb, y_center, x_right))
+        # Find text labels in legend area
+        for block in blocks:
+            if "lines" not in block:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    tb = span["bbox"]
+                    # Check if text is in legend area
+                    if legend_rect[0] <= tb[0] <= legend_rect[2] and legend_rect[1] <= tb[1] <= legend_rect[3]:
+                        label = span["text"].strip().lower()
+                        if 2 <= len(label) <= 30:
+                            y_center = (tb[1] + tb[3]) / 2
+                            x_left = tb[0]
+                            legend_labels.append((label, y_center, x_left))
+        if legend_boxes and legend_labels:
+            legend_found = True
+            break
+
+    # For each legend box, find the nearest rightward label (y-centers close, label x_left > box x_right)
+    legend_map = {}
+    if legend_found:
+        for rgb, yb, xr in legend_boxes:
+            best_label = None
+            best_dist = float('inf')
+            for label, yl, xl in legend_labels:
+                if abs(yl - yb) < 20 and xl > xr:  # y-centers close, label to right
+                    dist = abs(yl - yb) + (xl - xr)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_label = label
+            if best_label:
+                legend_map[rgb] = best_label
+        if debug:
+            print(f"Legend detected: {legend_map}")
+    else:
+        if debug:
+            print("Legend/key not detected; falling back to fixed color mapping.")
+
+    # --- CLUSTERING OF SHADED BOX COLORS ---
+    all_box_colors = []
+    all_box_color_rects = []
+    for page_num, page in enumerate(doc):
+        drawings = page.get_drawings()
+        for drawing in drawings:
+            fill_color = drawing.get("fill")
+            rgb = _normalize_rgb(fill_color)
+            rect = drawing["rect"]
+            if rgb and rgb != (1.0, 1.0, 1.0):
+                all_box_colors.append(rgb)
+                all_box_color_rects.append((rgb, rect))
+
+    if len(all_box_colors) >= 3:
+        k = min(4, len(set(all_box_colors)))
+        kmeans = KMeans(n_clusters=k, n_init=10, random_state=42)
+        X = np.array(all_box_colors)
+        kmeans.fit(X)
+        cluster_centers = kmeans.cluster_centers_
+        labels = kmeans.labels_
+        if debug:
+            print(f"KMeans found {k} color clusters: {cluster_centers}")
+        # Map clusters to legend categories
+        cluster_to_category = {}
+        for i, center in enumerate(cluster_centers):
+            best_label = None
+            best_dist = float('inf')
+            for key_color, key_label in legend_map.items():
+                dist = _color_distance(tuple(center), key_color)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_label = key_label
+            # Fallback: use color if no legend
+            cluster_to_category[i] = best_label if best_label else f"color_{i}"
+        if debug:
+            print(f"Cluster to category mapping: {cluster_to_category}")
+    else:
+        kmeans = None
+        cluster_to_category = {}
+
+    # Helper: classify by cluster
+    def classify_by_cluster(rgb):
+        if not kmeans:
+            return classify_box_color(rgb)
+        label = kmeans.predict([rgb])[0]
+        cat = cluster_to_category.get(label, 'unknown')
+        # Map legend label to canonical category
+        if 'train' in cat:
+            return 'training'
+        if 'bank' in cat:
+            return 'bank_holiday'
+        # Ensure 'bank holiday' is not double-counted as generic 'holiday'
+        if 'holiday' in cat and 'bank' not in cat:
+            return 'holiday'
+        if 'school' in cat:
+            return 'schoolday'
+        return 'unknown'
 
     for page_num, page in enumerate(doc):
         text = page.get_text()
@@ -125,8 +286,9 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
         day_headers = find_day_headers(blocks, month_headers)
         day_headers_map = {(dh['year'], dh['month']): dh for dh in day_headers}
         if day_headers:
-            print(f"    Found {len(day_headers)} month calendars with day-of-week headers")
-            page_reconstructed = reconstruct_month_dates(blocks, day_headers, month_headers, page_height * 0.85)
+            if debug:
+                print(f"    Found {len(day_headers)} month calendars with day-of-week headers")
+            page_reconstructed = reconstruct_month_dates(blocks, day_headers, month_headers, page_height * 0.85, debug=debug)
             # Store for later use
             if not hasattr(extract_with_pymupdf, 'all_reconstructed'):
                 extract_with_pymupdf.all_reconstructed = {}
@@ -135,7 +297,8 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
         # Detect shaded/colored cells using page drawings
         shaded_positions = []
         drawings = page.get_drawings()
-        print(f"    Found {len(drawings)} drawings on page")
+        if debug:
+            print(f"    Found {len(drawings)} drawings on page")
         shading_colors = {}
         for drawing in drawings:
             if drawing.get("fill"):
@@ -153,22 +316,36 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
                     continue
                 # Inflate to match visible coverage (boxes may be wider than text)
                 inflated = _inflate_rect(rect, margin=8)
-                shaded_positions.append({"rect": inflated, "color": rgb})
+                # --- Use cluster-based classification ---
+                cat = classify_by_cluster(rgb)
+                shaded_positions.append({"rect": inflated, "color": rgb, "category": cat})
                 color_str = f"RGB{rgb}" if rgb else "Unknown"
                 shading_colors[color_str] = shading_colors.get(color_str, 0) + 1
                 stats['shaded_cells'] += 1
 
-        if shading_colors:
-            print(f"    Shading colors detected (excluding white):")
-            for color, count in sorted(shading_colors.items(), key=lambda x: -x[1]):
-                print(f"      - {color}: {count} cells")
-        else:
-            print(f"    No valid shaded cells found")
+        if debug:
+            if shading_colors:
+                print(f"    Shading colors detected (excluding white):")
+                for color, count in sorted(shading_colors.items(), key=lambda x: -x[1]):
+                    print(f"      - {color}: {count} cells")
+            else:
+                print(f"    No valid shaded cells found")
 
         footer_y_threshold = page_height * 0.85
 
+        # Filter to likely day-cell boxes (exclude large month header bands etc.)
+        day_shaded_positions = []
+        for sp in shaded_positions:
+            x0, y0, x1, y1 = sp["rect"]
+            width = x1 - x0
+            height = y1 - y0
+            # Typical day cells ~28-44 px wide and ~29-34 px tall; allow a safe upper bound
+            if width <= 60 and height <= 50:
+                day_shaded_positions.append(sp)
+
         # Report sizes of colored (non-black, non-white) shaded boxes
-        print(f"    Shaded box sizes (excluding black/white):")
+        if debug:
+            print(f"    Shaded box sizes (excluding black/white):")
         size_map = {}  # color -> list of (width, height)
         for sp in shaded_positions:
             x0, y0, x1, y1 = sp["rect"]
@@ -181,22 +358,21 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
                     size_map[color_str] = []
                 size_map[color_str].append((width, height))
         
-        for color_str in sorted(size_map.keys()):
-            sizes = size_map[color_str]
-            if sizes:
-                avg_w = sum(s[0] for s in sizes) / len(sizes)
-                avg_h = sum(s[1] for s in sizes) / len(sizes)
-                min_w = min(s[0] for s in sizes)
-                max_w = max(s[0] for s in sizes)
-                min_h = min(s[1] for s in sizes)
-                max_h = max(s[1] for s in sizes)
-                print(f"      {color_str}: {len(sizes)} boxes, W={min_w:.0f}-{max_w:.0f} (avg {avg_w:.0f}), H={min_h:.0f}-{max_h:.0f} (avg {avg_h:.0f})")
+        if debug:
+            for color_str in sorted(size_map.keys()):
+                sizes = size_map[color_str]
+                if sizes:
+                    avg_w = sum(s[0] for s in sizes) / len(sizes)
+                    avg_h = sum(s[1] for s in sizes) / len(sizes)
+                    min_w = min(s[0] for s in sizes)
+                    max_w = max(s[0] for s in sizes)
+                    min_h = min(s[1] for s in sizes)
+                    max_h = max(s[1] for s in sizes)
+                    print(f"      {color_str}: {len(sizes)} boxes, W={min_w:.0f}-{max_w:.0f} (avg {avg_w:.0f}), H={min_h:.0f}-{max_h:.0f} (avg {avg_h:.0f})")
 
-        # Extract exam results days
-        extract_exam_results_days(text, start_year, exam_results_days)
-        
-        # Extract holiday dates from footer text
-        extract_holiday_dates(text, start_year, holidays)
+        # Footer-derived dates are ignored for day classification; rely on month tables only
+        # extract_exam_results_days(text, start_year, exam_results_days)
+        # extract_holiday_dates(text, start_year, holidays)
         
         # Debug: Find ALL day numbers in October region to diagnose mapping issues
         october_all_numbers = []
@@ -245,13 +421,14 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
         for target_day in [13, 20, 27]:
             matches = [n for n in all_page_numbers if n['day'] == target_day]
             if matches:
-                print(f"\n    🔍 Day {target_day} found on page:")
-                for m in matches:
-                    tb = m['text_bbox']
-                    mapped = m['month_mapped'] or '(unmapped)'
-                    print(f"        at ({tb[0]:.1f},{tb[1]:.1f}) → mapped to {mapped}")
+                if debug:
+                    print(f"\n    🔍 Day {target_day} found on page:")
+                    for m in matches:
+                        tb = m['text_bbox']
+                        mapped = m['month_mapped'] or '(unmapped)'
+                        print(f"        at ({tb[0]:.1f},{tb[1]:.1f}) → mapped to {mapped}")
         
-        if october_all_numbers:
+        if debug and october_all_numbers:
             print(f"\n    📅 ALL October 2025 day numbers on this page ({len(october_all_numbers)}):")
             for item in sorted(october_all_numbers, key=lambda x: x['day']):
                 tb = item['text_bbox']
@@ -299,7 +476,8 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
             month_row_centers = filled_row_centers
         
         # Extract shaded dates: look for day numbers WITHIN colored boxes
-        print(f"    Day numbers found within colored boxes (showing only ambiguous cases with margin < 10px):")
+        if debug:
+            print(f"    Day numbers found within colored boxes (showing only ambiguous cases with margin < 10px):")
         ambiguous_detections = []  # Track ambiguous cases for debug output
         october_debug = []  # Track all October date checks
         date_candidates = defaultdict(list)  # Collect all boxes per date, then pick best
@@ -326,9 +504,9 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
                         cp_x = (tb[0] + tb[2]) / 2
                         cp_y = tb[1] + (tb[3] - tb[1]) * 0.33
                         nearest_margin = None
-                        if shaded_positions:
+                        if day_shaded_positions:
                             margins = []
-                            for sp in shaded_positions:
+                            for sp in day_shaded_positions:
                                 x0, y0, x1, y1 = sp["rect"]
                                 mx = min(cp_x - x0, x1 - cp_x)
                                 my = min(cp_y - y0, y1 - cp_y)
@@ -343,7 +521,7 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
                         page_twenty_seven_spans.append(rec_span)
                         all_twenty_seven_spans.append(rec_span)
         
-        for i, sp in enumerate(shaded_positions):
+        for i, sp in enumerate(day_shaded_positions):
             x0, y0, x1, y1 = sp["rect"]
             color = sp["color"]
             if not color or color == (0.0, 0.0, 0.0) or color == (1.0, 1.0, 1.0):
@@ -485,7 +663,7 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
             cp_x = col['x_center']
             cp_y = row_map[row_index]
             best = None
-            for sp in shaded_positions:
+            for sp in day_shaded_positions:
                 x0, y0, x1, y1 = sp['rect']
                 if not (x0 < cp_x < x1 and y0 < cp_y < y1):
                     continue
@@ -504,11 +682,20 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
             if best:
                 date_candidates[iso].append(best)
 
-        # Infer shaded dates that lack visible text by aligning boxes to reconstructed calendar grid
-        for i, sp in enumerate(shaded_positions):
+        # Refined: Only map boxes to dates by grid if not already mapped by text
+        # Track which boxes have already been mapped by text
+        mapped_box_ids = set()
+        for iso_date, candidates in date_candidates.items():
+            for c in candidates:
+                mapped_box_ids.add((c['box_id'], tuple(c['rect'])))
+
+        for i, sp in enumerate(day_shaded_positions):
             color = sp["color"]
             if not color or color == (0.0, 0.0, 0.0) or color == (1.0, 1.0, 1.0):
                 continue
+            box_key = (i, tuple(sp["rect"]))
+            if box_key in mapped_box_ids:
+                continue  # Already mapped by text
 
             cx = (sp["rect"][0] + sp["rect"][2]) / 2
             cy = (sp["rect"][1] + sp["rect"][3]) / 2
@@ -550,27 +737,37 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
             margin = min(cp_x - sp["rect"][0], sp["rect"][2] - cp_x, cp_y - sp["rect"][1], sp["rect"][3] - cp_y)
             iso_date = f"{month_info['year']}-{month_info['month']:02d}-{candidate_day:02d}"
 
-            date_candidates[iso_date].append({
-                'box_id': i,
-                'color': color,
-                'color_str': f"RGB{color}" if color else "Unknown",
-                'margin': margin,
-                'check_point': (cp_x, cp_y),
-                'rect': sp["rect"]
-            })
+            # Only add if this date doesn't already have a candidate from a different box
+            already = [c for c in date_candidates.get(iso_date, []) if tuple(c['rect']) == tuple(sp["rect"])]
+            if not already:
+                date_candidates[iso_date].append({
+                    'box_id': i,
+                    'color': color,
+                    'color_str': f"RGB{color}" if color else "Unknown",
+                    'margin': margin,
+                    'check_point': (cp_x, cp_y),
+                    'rect': sp["rect"]
+                })
         
         # Process all date candidates and pick the best box (highest margin >= 1px)
-        print(f"\n    Processing {len(date_candidates)} dates with colored box candidates...")
+        if debug:
+            print(f"\n    Processing {len(date_candidates)} dates with colored box candidates...")
         for iso_date, candidates in date_candidates.items():
             # Filter candidates with margin >= 1px
             valid_candidates = [c for c in candidates if c['margin'] >= 1]
-            
+
             if valid_candidates:
-                # Pick the candidate with the best (highest) margin
+                # Pick best and classify as holiday, training, or bank holiday based on cluster/category
                 best = max(valid_candidates, key=lambda c: c['margin'])
-                shaded_holiday_dates.add(iso_date)
+                color_type = classify_by_cluster(best['color'])
+                if color_type == 'bank_holiday':
+                    if iso_date not in bank_holidays:
+                        bank_holidays.append(iso_date)
+                elif color_type == 'holiday':
+                    shaded_holiday_dates.add(iso_date)
+                elif color_type == 'training':
+                    shaded_training_dates.add(iso_date)
                 iso_date_color_map[iso_date] = best['color']
-                
                 # Track ambiguous if margin < 10px
                 if best['margin'] < 10:
                     ambiguous_detections.append({
@@ -588,7 +785,7 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
         for det in ambiguous_detections:
             ambiguous_by_box[det['box_id']].append(det)
         
-        if ambiguous_by_box:
+        if debug and ambiguous_by_box:
             print(f"    Ambiguous detections (margin < 10px) by box:")
             for box_id in sorted(ambiguous_by_box.keys()):
                 dets = ambiguous_by_box[box_id]
@@ -600,40 +797,44 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
                         print(f"        - Day {det['day']} ({det['iso_date']}): margin={det['margin']:.1f}px, check_point=({det['check_point'][0]:.0f},{det['check_point'][1]:.0f})")
         
         # Only show summary if there were ambiguous detections
-        if ambiguous_detections:
-            print(f"\n    ⚠ Found {len(ambiguous_detections)} ambiguous date detections (margin < 10px) - review these for potential spillover")
-        else:
-            print(f"\n    ✓ All date detections have clear margins (no ambiguous cases)")
-        
-        # Show October debug info
-        if october_debug:
-            print(f"\n    📅 October dates investigation ({len(october_debug)} checks):")
-            for oct in sorted(october_debug, key=lambda x: x['iso_date']):
-                print(f"      {oct['iso_date']}: Box[{oct['box_id']}] {oct['color']}")
-                print(f"        is_inside={oct['is_inside']}, margin={oct['margin']:.2f}px (x={oct['margin_x']:.2f}, y={oct['margin_y']:.2f})")
-                print(f"        check_point=({oct['check_point'][0]:.1f},{oct['check_point'][1]:.1f})")
-                print(f"        box_rect=({oct['rect'][0]:.0f},{oct['rect'][1]:.0f},{oct['rect'][2]:.0f},{oct['rect'][3]:.0f})")
-                print(f"        text_bbox=({oct['text_bbox'][0]:.1f},{oct['text_bbox'][1]:.1f},{oct['text_bbox'][2]:.1f},{oct['text_bbox'][3]:.1f})")
+        if debug:
+            if ambiguous_detections:
+                print(f"\n    ⚠ Found {len(ambiguous_detections)} ambiguous date detections (margin < 10px) - review these for potential spillover")
+            else:
+                print(f"\n    ✓ All date detections have clear margins (no ambiguous cases)")
+            # Show October debug info
+            if october_debug:
+                print(f"\n    📅 October dates investigation ({len(october_debug)} checks):")
+                for oct in sorted(october_debug, key=lambda x: x['iso_date']):
+                    print(f"      {oct['iso_date']}: Box[{oct['box_id']}] {oct['color']}")
+                    print(f"        is_inside={oct['is_inside']}, margin={oct['margin']:.2f}px (x={oct['margin_x']:.2f}, y={oct['margin_y']:.2f})")
+                    print(f"        check_point=({oct['check_point'][0]:.1f},{oct['check_point'][1]:.1f})")
+                    print(f"        box_rect=({oct['rect'][0]:.0f},{oct['rect'][1]:.0f},{oct['rect'][2]:.0f},{oct['rect'][3]:.0f})")
+                    print(f"        text_bbox=({oct['text_bbox'][0]:.1f},{oct['text_bbox'][1]:.1f},{oct['text_bbox'][2]:.1f},{oct['text_bbox'][3]:.1f})")
 
     # Focused debug for 2025-10-27 across all pages
     focus_date = "2025-10-27"
     if focused_candidates.get(focus_date):
-        print(f"\n  Focused debug (aggregated across pages) for {focus_date}:")
         cands = focused_candidates[focus_date]
-        print(f"    Candidates: {len(cands)}")
+        if debug:
+            print(f"\n  Focused debug (aggregated across pages) for {focus_date}:")
+            print(f"    Candidates: {len(cands)}")
         for c in sorted(cands, key=lambda x: -x['margin']):
             rect = c['rect']
             cp = c['check_point']
-            print(f"      Box[{c['box_id']}] {c['color_str']}: margin={c['margin']:.2f}px, rect=({rect[0]:.0f},{rect[1]:.0f},{rect[2]:.0f},{rect[3]:.0f}), check_point=({cp[0]:.0f},{cp[1]:.0f})")
+            if debug:
+                print(f"      Box[{c['box_id']}] {c['color_str']}: margin={c['margin']:.2f}px, rect=({rect[0]:.0f},{rect[1]:.0f},{rect[2]:.0f},{rect[3]:.0f}), check_point=({cp[0]:.0f},{cp[1]:.0f})")
         valid = [c for c in cands if c['margin'] >= 1]
         if valid:
             best = max(valid, key=lambda x: x['margin'])
-            print(f"    Chosen best: Box[{best['box_id']}] {best['color_str']} with margin {best['margin']:.2f}px")
-        else:
+            if debug:
+                print(f"    Chosen best: Box[{best['box_id']}] {best['color_str']} with margin {best['margin']:.2f}px")
+        elif debug:
             print("    No valid candidates (all margins < 1px)")
 
-    # Generate complete academic year: Sep 1 to Aug 31 and compute holidays/schooldays by complement
-    print(f"\n  Generating complete academic year calendar...")
+    # Generate complete academic year: Sep 1 to Aug 31 and compute schooldays/training/holidays
+    if debug:
+        print(f"\n  Generating complete academic year calendar...")
     start = date(start_year, 9, 1)
     end = date(start_year + 1, 8, 31)
     
@@ -642,13 +843,13 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
         if current.weekday() <= 4:  # Monday=0 to Friday=4
             iso_date = current.isoformat()
             
-            # Check if it's an exam results day
-            if iso_date in set(exam_results_days):
-                holidays.append(iso_date)
-            # Check if it's a shaded holiday
+            # Check if it's a training day (green box)
+            if iso_date in shaded_training_dates:
+                training_days.append(iso_date)
+            # Check if it's a holiday (orange/red box)
             elif iso_date in shaded_holiday_dates:
                 holidays.append(iso_date)
-            # Otherwise it's a schoolday
+            # Otherwise it's a schoolday (unshaded)
             else:
                 schooldays.append(iso_date)
         
@@ -656,49 +857,149 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
 
     # Drop any weekend dates that may have been added from footer parsing
     holidays[:] = sorted({d for d in holidays if date.fromisoformat(d).weekday() <= 4})
+
+    # Fill one-day gaps that sit between two holidays (e.g., late-July blocks with missing shading)
+    weekday_range = []
+    current = start
+    while current <= end:
+        if current.weekday() <= 4:
+            weekday_range.append(current)
+        current += timedelta(days=1)
+
+    holidays_set = set(holidays)
+    schooldays_set = set(schooldays)
+    training_set = set(training_days)
+    expected_weekdays = {d.isoformat() for d in weekday_range}
+    missing = sorted(expected_weekdays - (holidays_set | schooldays_set | training_set))
+
+    for iso in missing:
+        dt = date.fromisoformat(iso)
+        # find previous weekday in range
+        prev_dt = dt - timedelta(days=1)
+        while prev_dt.weekday() > 4:
+            prev_dt -= timedelta(days=1)
+        # find next weekday in range
+        next_dt = dt + timedelta(days=1)
+        while next_dt.weekday() > 4:
+            next_dt += timedelta(days=1)
+        if prev_dt.isoformat() in holidays_set and next_dt.isoformat() in holidays_set:
+            holidays.append(iso)
+            holidays_set.add(iso)
+            if debug:
+                print(f"    Filled gap as holiday: {iso} (between {prev_dt} and {next_dt})")
     
-    print(f"  Total schooldays: {len(schooldays)}")
-    print(f"  Total holidays: {len(holidays)}")
+    if debug:
+        print(f"  Total schooldays: {len(schooldays)}")
+        print(f"  Total holidays: {len(holidays)}")
+
+    # Apply optional overrides from overrides.json for manual corrections
+    overrides_path = Path("overrides.json")
+    bank_holidays = []
+    if overrides_path.exists():
+        try:
+            with open(overrides_path, 'r') as f:
+                overrides = json.load(f)
+            ov = overrides.get(academic_year)
+            if ov:
+                hset = set(holidays)
+                tset = set(training_days)
+                sset = set(schooldays)
+                bset = set()
+
+                force_sd = set(ov.get("force_schooldays", []))
+                force_hd = set(ov.get("force_holidays", []))
+                force_td = set(ov.get("force_training", []))
+                force_bh = set(ov.get("force_bank_holidays", []))
+
+                # Force schooldays: remove from holidays/training/bank holidays, add to schooldays
+                for iso in force_sd:
+                    hset.discard(iso)
+                    tset.discard(iso)
+                    bset.discard(iso)
+                    sset.add(iso)
+
+                # Force holidays: remove from schooldays/training/bank holidays, add to holidays
+                for iso in force_hd:
+                    sset.discard(iso)
+                    tset.discard(iso)
+                    bset.discard(iso)
+                    hset.add(iso)
+
+                # Force training: remove from schooldays/holidays/bank holidays, add to training
+                for iso in force_td:
+                    sset.discard(iso)
+                    hset.discard(iso)
+                    bset.discard(iso)
+                    tset.add(iso)
+
+                # Force bank holidays: remove from schooldays/training/holidays, add to bank holidays
+                for iso in force_bh:
+                    sset.discard(iso)
+                    tset.discard(iso)
+                    hset.discard(iso)
+                    bset.add(iso)
+
+                holidays[:] = sorted(hset)
+                training_days[:] = sorted(tset)
+                schooldays[:] = sorted(sset)
+                bank_holidays[:] = sorted(bset)
+
+                if debug and (force_sd or force_hd or force_td or force_bh):
+                    print("    Applied overrides:")
+                    if force_sd:
+                        print(f"      force_schooldays → {sorted(force_sd)}")
+                    if force_hd:
+                        print(f"      force_holidays → {sorted(force_hd)}")
+                    if force_td:
+                        print(f"      force_training → {sorted(force_td)}")
+                    if force_bh:
+                        print(f"      force_bank_holidays → {sorted(force_bh)}")
+        except Exception as e:
+            if debug:
+                print(f"    ⚠ Failed to apply overrides.json: {e}")
     
     # Debug: Check specific October dates
     october_dates = [
         "2025-10-22", "2025-10-23", "2025-10-24",
         "2025-10-27", "2025-10-29", "2025-10-30", "2025-10-31"
     ]
-    print(f"\n  October dates investigation:")
+    if debug:
+        print(f"\n  October dates investigation:")
     # Show October month header bounds if available
     oct_headers = [h for h in all_month_headers if h['month'] == 10 and h['year'] == 2025]
-    if oct_headers:
+    if debug and oct_headers:
         print(f"    October 2025 header bounds:")
         for h in oct_headers:
             print(f"      x=[{h['x_start']:.1f}, {h['x_end']:.1f}], y=[{h['y_start']:.1f}, {h['y_end']:.1f}]")
-    for d in october_dates:
-        in_shaded = d in shaded_holiday_dates
-        in_holidays = d in set(holidays)
-        in_schooldays = d in set(schooldays)
-        print(f"    {d}: in_shaded={in_shaded}, in_holidays={in_holidays}, in_schooldays={in_schooldays}")
+    if debug:
+        for d in october_dates:
+            in_shaded = d in shaded_holiday_dates
+            in_holidays = d in set(holidays)
+            in_schooldays = d in set(schooldays)
+            print(f"    {d}: in_shaded={in_shaded}, in_holidays={in_holidays}, in_schooldays={in_schooldays}")
 
     # Focused overview for 2025-10-27 right after October block
-    focus_date = "2025-10-27"
-    print(f"\n  Focused overview for {focus_date}:")
-    if 'focused_candidates' in locals() and focused_candidates.get(focus_date):
-        cands = focused_candidates[focus_date]
-        print(f"    Candidates found: {len(cands)}")
-        for c in sorted(cands, key=lambda x: -x['margin'])[:10]:
-            rect = c['rect']
-            cp = c['check_point']
-            print(f"      Box[{c['box_id']}] {c['color_str']}: margin={c['margin']:.2f}px, rect=({rect[0]:.0f},{rect[1]:.0f},{rect[2]:.0f},{rect[3]:.0f}), check_point=({cp[0]:.0f},{cp[1]:.0f})")
-        valid = [c for c in cands if c['margin'] >= 1]
-        if valid:
-            best = max(valid, key=lambda x: x['margin'])
-            print(f"    Chosen best: Box[{best['box_id']}] {best['color_str']} with margin {best['margin']:.2f}px")
+    if debug:
+        focus_date = "2025-10-27"
+        print(f"\n  Focused overview for {focus_date}:")
+        if 'focused_candidates' in locals() and focused_candidates.get(focus_date):
+            cands = focused_candidates[focus_date]
+            print(f"    Candidates found: {len(cands)}")
+            for c in sorted(cands, key=lambda x: -x['margin'])[:10]:
+                rect = c['rect']
+                cp = c['check_point']
+                print(f"      Box[{c['box_id']}] {c['color_str']}: margin={c['margin']:.2f}px, rect=({rect[0]:.0f},{rect[1]:.0f},{rect[2]:.0f},{rect[3]:.0f}), check_point=({cp[0]:.0f},{cp[1]:.0f})")
+            valid = [c for c in cands if c['margin'] >= 1]
+            if valid:
+                best = max(valid, key=lambda x: x['margin'])
+                print(f"    Chosen best: Box[{best['box_id']}] {best['color_str']} with margin {best['margin']:.2f}px")
+            else:
+                print("    No valid candidates (all margins < 1px)")
         else:
-            print("    No valid candidates (all margins < 1px)")
-    else:
-        print("    No candidates recorded for this date")
+            print("    No candidates recorded for this date")
 
     # Raw checks for '27' (all occurrences and mapped iso dates)
-    if all_twenty_seven_checks:
+    if debug and all_twenty_seven_checks:
         print(f"\n  Raw '27' checks summary:")
         # Group by iso_date to see mapping issues
         by_iso = defaultdict(list)
@@ -712,7 +1013,7 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
                 print(f"      Box[{chk['box_id']}] {chk['color_str']}: inside={chk['is_inside']}, margin={chk['margin']:.2f}px, rect=({rect[0]:.0f},{rect[1]:.0f},{rect[2]:.0f},{rect[3]:.0f}), check_point=({cp[0]:.0f},{cp[1]:.0f})")
 
     # Raw '27' text spans summary (independent of shaded boxes)
-    if all_twenty_seven_spans:
+    if debug and all_twenty_seven_spans:
         print(f"\n  Raw '27' text spans summary:")
         spans_by_iso = defaultdict(list)
         for s in all_twenty_seven_spans:
@@ -740,85 +1041,96 @@ def extract_with_pymupdf(pdf_path, academic_year, start_year, schooldays, holida
                 print(f"      text_bbox=({tb[0]:.1f},{tb[1]:.1f},{tb[2]:.1f},{tb[3]:.1f}), check_point=({cp[0]:.1f},{cp[1]:.1f}), nearest_margin={nm_str}")
 
     # Focused debug for 2025-10-27: show all candidate boxes and chosen best
-    focus_date = "2025-10-27"
-    if 'date_candidates' in locals() and focus_date in date_candidates:
-        print(f"\n  Focused debug for {focus_date}:")
-        candidates = date_candidates[focus_date]
-        print(f"    Candidates: {len(candidates)}")
-        for c in sorted(candidates, key=lambda x: -x['margin']):
-            rect = c['rect']
-            cp = c['check_point']
-            print(f"      Box[{c['box_id']}] {c['color_str']}: margin={c['margin']:.2f}px, rect=({rect[0]:.0f},{rect[1]:.0f},{rect[2]:.0f},{rect[3]:.0f}), check_point=({cp[0]:.0f},{cp[1]:.0f})")
-        # Determine the best candidate as per selection logic
-        valid_candidates = [c for c in candidates if c['margin'] >= 1]
-        if valid_candidates:
-            best = max(valid_candidates, key=lambda c: c['margin'])
-            print(f"    Chosen best: Box[{best['box_id']}] {best['color_str']} with margin {best['margin']:.2f}px")
-        else:
-            print("    No valid candidates (all margins < 1px)")
+    if debug:
+        focus_date = "2025-10-27"
+        if 'date_candidates' in locals() and focus_date in date_candidates:
+            print(f"\n  Focused debug for {focus_date}:")
+            candidates = date_candidates[focus_date]
+            print(f"    Candidates: {len(candidates)}")
+            for c in sorted(candidates, key=lambda x: -x['margin']):
+                rect = c['rect']
+                cp = c['check_point']
+                print(f"      Box[{c['box_id']}] {c['color_str']}: margin={c['margin']:.2f}px, rect=({rect[0]:.0f},{rect[1]:.0f},{rect[2]:.0f},{rect[3]:.0f}), check_point=({cp[0]:.0f},{cp[1]:.0f})")
+            # Determine the best candidate as per selection logic
+            valid_candidates = [c for c in candidates if c['margin'] >= 1]
+            if valid_candidates:
+                best = max(valid_candidates, key=lambda c: c['margin'])
+                print(f"    Chosen best: Box[{best['box_id']}] {best['color_str']} with margin {best['margin']:.2f}px")
+            else:
+                print("    No valid candidates (all margins < 1px)")
     
     # Ensure single close at the very end
     doc.close()
     
-    weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    print(f"\n  Statistics for {academic_year}:")
-    print(f"    Months detected: {len(all_dates_by_month)}")
-    print(f"    Shaded cells detected: {stats['shaded_cells']}")
-    print(f"    Marked dates (*/shaded): {stats['marked_dates']}")
-    print(f"    Total numbers found: {stats['total_numbers']}")
-    print(f"    All weekdays generated: {stats['weekdays']}")
-    print(f"    All weekends: {stats['weekends']}")
-    print(f"    By day: " + ", ".join([f"{weekday_names[i]}={stats['by_weekday'][i]}" for i in range(7)]))
-    
-    print(f"\n  Expected days per month:")
-    for month_key in sorted(stats['expected_by_month'].keys()):
-        count = stats['expected_by_month'][month_key]
-        print(f"    {month_key}: {count} days")
-    print(f"    TOTAL EXPECTED: {stats['expected_total']} days")
-    
-    print(f"\n  Extracted results:")
-    print(f"    Total schooldays extracted: {len(schooldays)}")
-    print(f"    Total holidays extracted: {len(holidays)}")
-
-    # Focused color debug for July 2026 key dates
-    target_july = [
-        "2026-07-23",
-        "2026-07-24",
-        "2026-07-30",
-        "2026-07-31",
-    ]
-    print("\n  July 2026 color check:")
-    for d in target_july:
-        color = iso_date_color_map.get(d)
-        status = "holiday" if d in holidays else ("schoolday" if d in schooldays else "absent")
-        print(f"    {d}: {status}, color={color}")
+    if debug:
+        weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        print(f"\n  Statistics for {academic_year}:")
+        print(f"    Months detected: {len(all_dates_by_month)}")
+        print(f"    Shaded cells detected: {stats['shaded_cells']}")
+        print(f"    Marked dates (*/shaded): {stats['marked_dates']}")
+        print(f"    Total numbers found: {stats['total_numbers']}")
+        print(f"    All weekdays generated: {stats['weekdays']}")
+        print(f"    All weekends: {stats['weekends']}")
+        print(f"    By day: " + ", ".join([f"{weekday_names[i]}={stats['by_weekday'][i]}" for i in range(7)]))
+        print(f"\n  Expected days per month:")
+        for month_key in sorted(stats['expected_by_month'].keys()):
+            count = stats['expected_by_month'][month_key]
+            print(f"    {month_key}: {count} days")
+        print(f"    TOTAL EXPECTED: {stats['expected_total']} days")
+        print(f"\n  Extracted results:")
+        print(f"    Total schooldays extracted: {len(schooldays)}")
+        print(f"    Total holidays extracted: {len(holidays)}")
+        # Focused color debug for July 2026 key dates
+        target_july = [
+            "2026-07-23",
+            "2026-07-24",
+            "2026-07-30",
+            "2026-07-31",
+        ]
+        print("\n  July 2026 color check:")
+        for d in target_july:
+            color = iso_date_color_map.get(d)
+            status = "holiday" if d in holidays else ("schoolday" if d in schooldays else "absent")
+            print(f"    {d}: {status}, color={color}")
 
 def find_month_headers(blocks, start_year):
     """Find month headers with their y-positions and x-positions."""
     headers = []
+    # Accept either "September 2026 (22 days)" or "September (22 days)" or just "September 2026"
+    month_re = re.compile(
+        r"^(January|February|March|April|May|June|July|August|September|October|November|December)"
+        r"(?:\s+(\d{4}))?"  # optional explicit year
+        r"(?:\s*\(\s*(\d+)\s+days?\s*\))?$",
+        re.IGNORECASE,
+    )
+
     for block in blocks:
-        if "lines" in block:
-            for line in block["lines"]:
-                text = " ".join(span["text"] for span in line["spans"])
-                match = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})", text, re.IGNORECASE)
-                if match:
-                    month_name = match.group(1)
-                    year = int(match.group(2))
-                    month = MONTH_MAP[month_name.lower()[:3]]
-                    bbox = line["bbox"]
-                    # Use fixed width for calendar (approximately 7 columns * 25px = 175px)
-                    headers.append({
-                        "month": month,
-                        "year": year,
-                        "x_start": bbox[0],
-                        "x_end": bbox[0] + 180,  # Fixed calendar width
-                        "y_start": bbox[1],
-                        "y_end": bbox[1] + 150  # Approximate month calendar height
-                    })
-    
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            text = " ".join(span["text"] for span in line["spans"]).strip()
+            match = month_re.match(text)
+            if not match:
+                continue
+
+            month_name, year_str, _ = match.groups()
+            month = MONTH_MAP[month_name.lower()[:3]]
+            # Infer year when it is not present in the header
+            year = int(year_str) if year_str else (start_year if month >= 9 else start_year + 1)
+
+            bbox = line["bbox"]
+            headers.append({
+                "month": month,
+                "year": year,
+                "x_start": bbox[0],
+                "x_end": bbox[0] + 180,  # Fixed calendar width
+                "y_start": bbox[1],
+                "y_end": bbox[1] + 150  # Approximate month calendar height
+            })
+
     # Sort by y-position, then x-position
     headers.sort(key=lambda h: (h["y_start"], h["x_start"]))
-    
+
     return headers
 
 def find_day_headers(blocks, month_headers):
@@ -826,69 +1138,85 @@ def find_day_headers(blocks, month_headers):
     day_header_info = []
     
     for month in month_headers:
-        # Look for M T W T F S S pattern within this month's region
+        # Collect all single-letter spans that fall inside this month's region
+        letter_spans = []
         for block in blocks:
             if "lines" not in block:
                 continue
             for line in block["lines"]:
-                # Check if line is within this month's region
-                line_bbox = line["bbox"]
-                if not (month["x_start"] <= line_bbox[0] <= month["x_end"] and
-                        month["y_start"] <= line_bbox[1] <= month["y_end"]):
-                    continue
-                
-                # Collect all single-letter text spans in this line
-                letters = []
                 for span in line["spans"]:
                     txt = span["text"].strip()
-                    if len(txt) == 1 and txt.upper() in 'MTWFS':
-                        letters.append({
-                            'letter': txt.upper(),
-                            'x': (span["bbox"][0] + span["bbox"][2]) / 2,
-                            'bbox': span["bbox"]
-                        })
-                
-                # Check if we have M T W T F S S pattern (7 letters)
-                if len(letters) >= 7:
-                    letter_str = ''.join([l['letter'] for l in letters[:7]])
-                    if letter_str in ['MTWTFSS', 'SMTWTFS']:  # Handle different orderings
-                        # Map each letter to day-of-week (0=Mon, 6=Sun)
-                        if letter_str == 'MTWTFSS':
-                            day_map = ['M','T','W','T','F','S','S']
-                        else:  # SMTWTFS
-                            day_map = ['S','M','T','W','T','F','S']
-                        
-                        columns = []
-                        for i, letter_info in enumerate(letters[:7]):
-                            dow = day_map[i]
-                            # Convert to Python weekday (0=Mon, 6=Sun)
-                            if dow == 'M':
-                                weekday = 0
-                            elif dow == 'T' and i in [1, 3]:  # Distinguish Tue/Thu
-                                weekday = 1 if i == 1 else 3
-                            elif dow == 'W':
-                                weekday = 2
-                            elif dow == 'F':
-                                weekday = 4
-                            elif dow == 'S' and i in [5, 6]:
-                                weekday = 5 if i == 5 else 6
-                            else:
-                                weekday = None
-                            
-                            if weekday is not None:
-                                columns.append({
-                                    'weekday': weekday,
-                                    'x_center': letter_info['x'],
-                                    'x_range': (letter_info['bbox'][0] - 10, letter_info['bbox'][2] + 10)
-                                })
-                        
-                        day_header_info.append({
-                            'month': month['month'],
-                            'year': month['year'],
-                            'columns': columns,
-                            'y_below': line_bbox[3]  # Numbers appear below this line
-                        })
-                        break
+                    if len(txt) != 1 or txt.upper() not in 'MTWFS':
+                        continue
+                    bbox = span["bbox"]
+                    x_center = (bbox[0] + bbox[2]) / 2
+                    y_center = (bbox[1] + bbox[3]) / 2
+                    if not (month["x_start"] <= x_center <= month["x_end"] and
+                            month["y_start"] <= y_center <= month["y_end"]):
+                        continue
+                    letter_spans.append({
+                        'letter': txt.upper(),
+                        'x_center': x_center,
+                        'y_center': y_center,
+                        'bbox': bbox
+                    })
+
+        if not letter_spans:
+            continue
+
+        # Group by row (shared y) because some PDFs render one letter per line
+        rows = defaultdict(list)
+        for sp in letter_spans:
+            y_key = round(sp['y_center'], 1)
+            rows[y_key].append(sp)
+
+        found = False
+        for row_spans in rows.values():
+            if len(row_spans) < 7:
+                continue
+            ordered = sorted(row_spans, key=lambda s: s['x_center'])
+            letter_str = ''.join([s['letter'] for s in ordered[:7]])
+            if letter_str not in ['MTWTFSS', 'SMTWTFS']:
+                continue
+
+            day_map = ['M','T','W','T','F','S','S'] if letter_str == 'MTWTFSS' else ['S','M','T','W','T','F','S']
+
+            columns = []
+            for i, sp in enumerate(ordered[:7]):
+                dow = day_map[i]
+                if dow == 'M':
+                    weekday = 0
+                elif dow == 'T' and i in [1, 3]:
+                    weekday = 1 if i == 1 else 3
+                elif dow == 'W':
+                    weekday = 2
+                elif dow == 'F':
+                    weekday = 4
+                elif dow == 'S' and i in [5, 6]:
+                    weekday = 5 if i == 5 else 6
+                else:
+                    weekday = None
+
+                if weekday is not None:
+                    columns.append({
+                        'weekday': weekday,
+                        'x_center': sp['x_center'],
+                        'x_range': (sp['bbox'][0] - 10, sp['bbox'][2] + 10)
+                    })
+
+            if columns:
+                y_below = max(sp['bbox'][3] for sp in ordered[:7])
+                day_header_info.append({
+                    'month': month['month'],
+                    'year': month['year'],
+                    'columns': columns,
+                    'y_below': y_below
+                })
+                found = True
+                break
+
+        if not found:
+            continue
     
     return day_header_info
 
@@ -916,7 +1244,7 @@ def find_month_for_position(bbox, month_headers):
     
     return None
 
-def reconstruct_month_dates(blocks, day_headers, month_headers, footer_y_threshold):
+def reconstruct_month_dates(blocks, day_headers, month_headers, footer_y_threshold, debug=False):
     """Reconstruct all dates in each month using day-of-week column headers."""
     from calendar import monthrange
     reconstructed = {}  # {(year, month): {day: weekday}}
@@ -969,16 +1297,19 @@ def reconstruct_month_dates(blocks, day_headers, month_headers, footer_y_thresho
                     month_dates[day] = weekday
                 
                 reconstructed[(year, month)] = month_dates
-                print(f"      Reconstructed {year}-{month:02d}: {days_in_month} days starting on {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][start_weekday]}")
+                if debug:
+                    print(f"      Reconstructed {year}-{month:02d}: {days_in_month} days starting on {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][start_weekday]}")
     
     return reconstructed
 
-def extract_with_pdfplumber(pdf_path, academic_year, start_year, schooldays, holidays):
+def extract_with_pdfplumber(pdf_path, academic_year, start_year, schooldays, holidays, debug=False):
     """Fallback to pdfplumber."""
-    print(f"Processing {academic_year} with pdfplumber (install PyMuPDF for better results)...")
+    if debug:
+        print(f"Processing {academic_year} with pdfplumber (install PyMuPDF for better results)...")
     schooldays, holidays = [], []
     with pdfplumber.open(pdf_path) as pdf:
-        print(f"Processing {academic_year}...")
+        if debug:
+            print(f"Processing {academic_year}...")
         for page_num, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
             tables = []
@@ -1222,13 +1553,13 @@ def parse_month_headers(text: str):
     return months
 
 def parse_expected_schoolday_counts(text: str, start_year: int):
-    """Extract expected schoolday counts per month from headers like 'September 2025 (22 days)'."""
+    """Extract expected schoolday counts per month from headers like 'September 2025 (22 days)' or 'September (22 days)'."""
     counts = {}
-    pattern = r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{4})\s+\((\d+)\s+days?\)"
+    pattern = r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?:\s+(\d{4}))?\s*\(\s*(\d+)\s+days?\s*\)"
     for match in re.finditer(pattern, text, flags=re.IGNORECASE):
         month_word, year_str, count_str = match.groups()
         month = MONTH_MAP[month_word.lower()[:3]]
-        year = int(year_str)
+        year = int(year_str) if year_str else (start_year if month >= 9 else start_year + 1)
         key = f"{year}-{month:02d}"
         counts[key] = int(count_str)
     return counts
@@ -1284,6 +1615,7 @@ def extract_exam_results_days(text: str, start_year: int, exam_results_days: lis
             pass
 
 def main():
+    debug = '--debug' in sys.argv
     print("UTC Sheffield Term Dates Extractor\n")
     
     if not HAS_PYMUPDF:
@@ -1301,38 +1633,41 @@ def main():
         print("✗ No PDFs downloaded successfully")
         return
     
-    print("\n" + "="*50 + "\n")
+    if debug:
+        print("\n" + "="*50 + "\n")
     
     # Extract schooldays from each PDF
     all_data = {
         "last_updated": datetime.now().isoformat(),
+        "all_schooldays": [],  # Combined children-in-school days from all academic years
         "academic_years": []
     }
     
     for year, pdf_path in pdf_files.items():
-        data = extract_schooldays_from_pdf(pdf_path, year)
+        data = extract_schooldays_from_pdf(pdf_path, year, debug=debug)
         all_data["academic_years"].append(data)
         
         # Analyze overlaps and gaps
-        print(f"\n  Analysis for {year}:")
+        if debug:
+            print(f"\n  Analysis for {year}:")
         schooldays_set = set(data["schooldays"])
         holidays_set = set(data["holidays"])
         exam_results_set = set(data.get("exam_results_days", []))
         
-        if exam_results_set:
+        if exam_results_set and debug:
             print(f"    📅 Exam results days: {len(exam_results_set)}")
             for d in sorted(exam_results_set):
                 print(f"      - {d}")
         
         # Check for overlaps
         overlap = schooldays_set & holidays_set
-        if overlap:
+        if overlap and debug:
             print(f"    ⚠ OVERLAP: {len(overlap)} dates in BOTH schooldays and holidays:")
             for d in sorted(overlap)[:10]:
                 print(f"      - {d}")
             if len(overlap) > 10:
                 print(f"      ... and {len(overlap) - 10} more")
-        else:
+        elif debug:
             print(f"    ✓ No overlaps between schooldays and holidays")
         
         # Generate all weekdays in the academic year range
@@ -1353,32 +1688,38 @@ def main():
                 all_extracted = schooldays_set | holidays_set
                 missing = expected_weekdays - all_extracted
                 
-                if missing:
+                if missing and debug:
                     print(f"    ⚠ MISSING: {len(missing)} weekdays not in either list:")
                     for d in sorted(missing)[:10]:
                         print(f"      - {d}")
                     if len(missing) > 10:
                         print(f"      ... and {len(missing) - 10} more")
-                else:
+                elif debug:
                     print(f"    ✓ All weekdays accounted for between {start_date} and {end_date}")
                 
                 total_weekdays = len(expected_weekdays)
                 coverage = len(all_extracted) / total_weekdays * 100 if total_weekdays > 0 else 0
-                print(f"    Coverage: {len(all_extracted)}/{total_weekdays} weekdays ({coverage:.1f}%)")
+                if debug:
+                    print(f"    Coverage: {len(all_extracted)}/{total_weekdays} weekdays ({coverage:.1f}%)")
+    
+    # Aggregate all_schooldays (children in school) from all academic years
+    all_data["all_schooldays"] = sorted(set().union(*[ay["schooldays"] for ay in all_data["academic_years"]]))
     
     # Write to JSON file
     output_file = "schooldays.json"
     with open(output_file, 'w') as f:
         json.dump(all_data, f, indent=2)
     
-    print(f"\n✓ Schooldays extracted to {output_file}")
+    if debug:
+        print(f"\n✓ Schooldays extracted to {output_file}")
     
     # Calculate totals - no dedup needed
     total_schooldays = sum(len(y['schooldays']) for y in all_data['academic_years'])
+    total_training_days = sum(len(y.get('training_days', [])) for y in all_data['academic_years'])
     total_holidays = sum(len(y['holidays']) for y in all_data['academic_years'])
     total_exam_days = sum(len(y.get('exam_results_days', [])) for y in all_data['academic_years'])
     total_teaching_days = total_schooldays
-    total_weekdays = total_schooldays + total_holidays
+    total_weekdays = total_schooldays + total_training_days + total_holidays
     
     # Calculate weekends
     total_weekends = 0
@@ -1394,7 +1735,9 @@ def main():
                 current = current + timedelta(days=1)
     
     print(f"\n  📊 Summary:")
-    print(f"    Teaching days (schooldays): {total_teaching_days}")
+    print(f"    Children in school (schooldays): {total_schooldays}")
+    print(f"    Staff training days: {total_training_days}")
+    print(f"    School open (children or staff): {total_schooldays + total_training_days}")
     print(f"    Holidays/closures: {total_holidays}")
     print(f"    Exam results days: {total_exam_days}")
     print(f"    Total weekdays (Mon-Fri): {total_weekdays}")
