@@ -143,7 +143,7 @@
         if (schooldaysCache.loaded) return schooldaysCache.set;
         if (schooldaysCache.promise) return schooldaysCache.promise;
 
-        schooldaysCache.promise = fetch('schooldays.json')
+        schooldaysCache.promise = fetch('https://utcsheffield.github.io/term_dates/schools/sutc/school_dates.json')
             .then(resp => resp.json())
             .then(data => {
                 schooldaysCache.loaded = true;
